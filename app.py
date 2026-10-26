@@ -1,6 +1,5 @@
-
-import os
 import json
+import requests
 import streamlit as st
 
 st.set_page_config(
@@ -9,13 +8,16 @@ st.set_page_config(
     layout="wide"
 )
 
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:1b"
+
 # Kitchen-themed design
 st.markdown("""
 <style>
 .stApp {
     background:
-        linear-gradient(rgba(255, 249, 238, 0.90),
-                        rgba(255, 249, 238, 0.94)),
+        linear-gradient(rgba(255,249,238,0.90),
+                        rgba(255,249,238,0.94)),
         url("https://images.unsplash.com/photo-1556911220-e15b29be8c8f");
     background-size: cover;
     background-position: center;
@@ -43,7 +45,8 @@ h1, h2, h3 {
     padding: 12px 15px;
     margin: 8px 0;
 }
-.stButton > button {
+.stButton > button,
+.stFormSubmitButton > button {
     background: #28664e;
     color: white;
     border-radius: 12px;
@@ -51,7 +54,8 @@ h1, h2, h3 {
     min-height: 45px;
     font-weight: bold;
 }
-.stButton > button:hover {
+.stButton > button:hover,
+.stFormSubmitButton > button:hover {
     background: #194b38;
     color: white;
 }
@@ -59,23 +63,11 @@ h1, h2, h3 {
 """, unsafe_allow_html=True)
 
 
-def generate_recipe(dish, ingredients, preference, spice,
-                    servings, max_time, budget):
-
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if not api_key:
-        return None, (
-            "AI recipe generation kosam GEMINI_API_KEY set cheyyali. "
-            "Setup instructions kinda unnayi."
-        )
-
-    try:
-        from google import genai
-
-        client = genai.Client(api_key=api_key)
-
-        prompt = f"""
+def generate_recipe(
+    dish, ingredients, preference, spice,
+    servings, max_time, budget
+):
+    prompt = f"""
 You are an experienced Indian cooking chef.
 
 Create a practical recipe for this exact dish: {dish}
@@ -83,27 +75,25 @@ Create a practical recipe for this exact dish: {dish}
 Available ingredients: {ingredients}
 Food preference: {preference}
 Spice level: {spice}
-Servings: {servings}
+Number of servings: {servings}
 Maximum cooking time: {max_time} minutes
 Budget per serving: Rs. {budget}
 
-Requirements:
-- Give a recipe specifically for the requested dish.
-- Do not replace it with an unrelated generic curry.
-- Respect the food preference and available ingredients.
-- If an essential ingredient is missing, list it separately.
+Instructions:
+- Make the requested dish, not an unrelated recipe.
+- Respect the food preference and listed ingredients.
+- Never include meat or eggs in a vegetarian or vegan recipe.
+- List essential missing ingredients separately.
 - Give realistic ingredient quantities for the servings.
-- Give 8 to 10 detailed, logically ordered cooking steps.
-- Keep the method within the time limit where practical.
-- Never invent nutritional or cost guarantees.
-- Include cooking tips and approximate cooking time.
-- If the dish cannot reasonably meet the preferences or budget,
-  explain that honestly.
+- Provide 8 detailed, logically ordered cooking steps.
+- Include useful cooking tips and approximate cooking time.
+- Be honest if the requested time or budget is unrealistic.
+- Return ONLY valid JSON. Do not use Markdown fences.
 
-Return ONLY valid JSON in this format:
+Use exactly this JSON structure:
 {{
   "title": "Dish name",
-  "description": "Short dish description",
+  "description": "Short description",
   "time": "Approximate cooking time",
   "ingredients": [
     {{"name": "Ingredient", "quantity": "Amount"}}
@@ -114,25 +104,56 @@ Return ONLY valid JSON in this format:
 }}
 """
 
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "stream": False,
+                "format": "json",
+                "options": {
+                    "temperature": 0.3
+                }
+            },
+            timeout=(10, 300)
         )
 
-        result_text = response.text.strip()
-        result_text = result_text.replace("```json", "").replace("```", "").strip()
+        response.raise_for_status()
+        data = response.json()
+        result_text = data.get("response", "").strip()
+
+        if not result_text:
+            return None, "AI nunchi response raledu. Malli try cheyyi."
+
         recipe = json.loads(result_text)
 
+        if not isinstance(recipe, dict):
+            return None, "Recipe response format correct ga ledu."
+
         if not recipe.get("ingredients") or not recipe.get("steps"):
-            return None, "AI valid recipe ivvaledu. Malli try cheyyi."
+            return None, "Complete recipe raledu. Malli try cheyyi."
 
         return recipe, None
 
-    except Exception as e:
+    except requests.exceptions.ConnectionError:
         return None, (
-            "Recipe generate avvaledu. API key, internet connection, "
-            "model access check cheyyi. Details: " + str(e)
+            "Ollama connect avvaledu. Ollama install chesi, "
+            "run avuthundo check cheyyi. Tarvatha malli try cheyyi."
         )
+    except requests.exceptions.Timeout:
+        return None, (
+            "Recipe generate avvadaniki ekkuva time pattindi. "
+            "Konchem sepu tarvatha malli try cheyyi."
+        )
+    except requests.exceptions.HTTPError as e:
+        return None, (
+            f"Ollama HTTP error: {e}. Model name and Ollama status check cheyyi."
+        )
+    except (json.JSONDecodeError, ValueError):
+        return None, "AI valid JSON recipe ivvaledu. Malli try cheyyi."
+    except Exception as e:
+        return None, f"Recipe generation error: {e}"
 
 
 # Header
@@ -140,6 +161,7 @@ st.markdown("# 🍳 AI Recipe Generator")
 st.markdown(
     "### Fresh ingredients + your preferences = your perfect recipe ❤️"
 )
+st.caption("Powered by Ollama local AI")
 st.divider()
 
 left, right = st.columns([1, 2.1], gap="large")
@@ -211,10 +233,17 @@ with right:
         elif not ingredients.strip():
             st.warning("Available ingredients enter cheyyi.")
         else:
-            with st.spinner("👩‍🍳 Preparing your personalized recipe..."):
+            with st.spinner(
+                "👩‍🍳 AI chef is preparing your recipe..."
+            ):
                 recipe, error = generate_recipe(
-                    dish, ingredients, preference, spice,
-                    servings, max_time, budget
+                    dish.strip(),
+                    ingredients.strip(),
+                    preference,
+                    spice,
+                    int(servings),
+                    max_time,
+                    int(budget)
                 )
 
             if error:
@@ -222,21 +251,23 @@ with right:
             else:
                 st.session_state["recipe"] = recipe
                 st.session_state["recipe_settings"] = {
-                    "servings": servings,
+                    "servings": int(servings),
                     "preference": preference,
                     "spice": spice,
-                    "budget": budget
+                    "budget": int(budget)
                 }
 
     recipe = st.session_state.get("recipe")
+    settings = st.session_state.get("recipe_settings", {})
 
-    if recipe:
-        settings = st.session_state["recipe_settings"]
-
+    if recipe and settings:
         st.markdown('<div class="recipe-card">', unsafe_allow_html=True)
-        st.markdown(f"# 🍽️ {recipe.get('title', dish)}")
+        st.markdown(f"# 🍽️ {recipe.get('title', 'Your Recipe')}")
         st.write(recipe.get("description", ""))
-        st.write(f"⏱️ Approximate time: {recipe.get('time', 'Not specified')}")
+        st.write(
+            f"⏱️ Approximate time: "
+            f"{recipe.get('time', 'Not specified')}"
+        )
         st.write(f"🍴 Servings: {settings['servings']}")
         st.write(f"🥗 Preference: {settings['preference']}")
         st.write(f"🌶️ Spice level: {settings['spice']}")
@@ -247,13 +278,18 @@ with right:
 
         with col1:
             st.markdown("### 🥕 Ingredients & quantities")
+
             for item in recipe.get("ingredients", []):
-                st.write(
-                    f"• **{item.get('name', 'Ingredient')}:** "
-                    f"{item.get('quantity', 'As needed')}"
-                )
+                if isinstance(item, dict):
+                    st.write(
+                        f"• **{item.get('name', 'Ingredient')}:** "
+                        f"{item.get('quantity', 'As needed')}"
+                    )
+                else:
+                    st.write(f"• {item}")
 
             missing = recipe.get("missing_ingredients", [])
+
             if missing:
                 st.markdown("### 🛒 Additional ingredients needed")
                 for item in missing:
@@ -265,6 +301,7 @@ with right:
 
         with col2:
             st.markdown("### 👩‍🍳 Step-by-step cooking method")
+
             for i, step in enumerate(recipe.get("steps", []), 1):
                 st.markdown(
                     f'<div class="step-card"><b>Step {i}:</b> '
@@ -273,14 +310,19 @@ with right:
                 )
 
         download_text = (
-            f"{recipe.get('title', dish)}\n\n"
+            f"{recipe.get('title', 'Recipe')}\n\n"
             f"Description: {recipe.get('description', '')}\n"
             f"Cooking time: {recipe.get('time', '')}\n"
             f"Servings: {settings['servings']}\n\n"
             "INGREDIENTS\n"
             + "\n".join(
                 f"- {x.get('name', '')}: {x.get('quantity', '')}"
+                if isinstance(x, dict) else f"- {x}"
                 for x in recipe.get("ingredients", [])
+            )
+            + "\n\nMISSING INGREDIENTS\n"
+            + "\n".join(
+                f"- {x}" for x in recipe.get("missing_ingredients", [])
             )
             + "\n\nCOOKING METHOD\n"
             + "\n".join(
@@ -288,7 +330,9 @@ with right:
                 for i, step in enumerate(recipe.get("steps", []), 1)
             )
             + "\n\nCOOKING TIPS\n"
-            + "\n".join(f"- {tip}" for tip in recipe.get("tips", []))
+            + "\n".join(
+                f"- {tip}" for tip in recipe.get("tips", [])
+            )
         )
 
         st.download_button(
@@ -298,6 +342,7 @@ with right:
             mime="text/plain",
             use_container_width=True
         )
+
     else:
         st.markdown("""
         <div class="recipe-card">
@@ -311,6 +356,7 @@ with right:
 
 st.divider()
 st.markdown(
-    "<center>🌿 Fresh Ingredients, Better Recipes · Happy Cooking! ❤️</center>",
+    "<center>🌿 Fresh Ingredients, Better Recipes · "
+    "Happy Cooking! ❤️</center>",
     unsafe_allow_html=True
 )
